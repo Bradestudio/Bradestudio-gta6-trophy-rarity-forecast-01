@@ -7,14 +7,28 @@ before the case's checkpoint) and writes, for each case, five quantiles
 
 Model, per trophy, on the logit scale:
   * Fit a least-squares line of logit(rate) against ln(1 + hours since
-    2026-11-19T00:00Z). Consecutive reads that repeat the previous rate
-    are dropped first, so a frozen page cannot weigh one level twice.
+    2026-11-19T00:00Z) over the last 24 hours of reads only. The launch
+    night's first refresh dilutes every rate while tracked players flood
+    in, so the full history is U-shaped and a line through all of it
+    points the wrong way; the recent window follows the recovery trend
+    the page is actually on. Consecutive reads that repeat the previous
+    rate are dropped first, so a frozen page cannot weigh one level twice.
   * Shrink each slope 25% toward the median slope across all trophies,
     and damp the extrapolation toward the target.
   * If the whole history is perfectly flat over at least an hour, the
-    page is treated as frozen and due a refresh: the median logit is
-    shifted down by 1.2 and extra variance is added, because a refresh
-    dilutes every rate as newly tracked players join with fewer trophies.
+    page is treated as frozen and due a refresh. A refresh does not move
+    every trophy the same way: the new players a refresh brings hold the
+    easy trophies and almost none of the rare ones, so the median falls
+    by a rarity-dependent dilution instead of one flat shift. The
+    dilution is modelled from the refresh itself: tracked players grow
+    by a factor R, each new player holds trophy i with probability
+    q_i = min(1, A * r_i ** (1 + BETA)), with A set so the new cohort
+    holds MU trophies a player on average, and the refreshed rate is
+    (r_i + (R - 1) * q_i) / R. R, BETA and MU are priors calibrated on
+    the launch night's documented refresh (638 to 3,868 players tracked,
+    943 to 4,276 trophies earned, and the house baseline's practice loss
+    near 1.5, which only a new cohort that holds almost nothing but the
+    easiest trophy can explain). Extra spread is added for the refresh.
   * The spread combines a random-walk term over the horizon, the fit's
     residual scatter, and slope uncertainty, widened further by the
     refresh prior when it applies.
@@ -50,17 +64,25 @@ RATE_LOW = 0.01
 RATE_HIGH = 99.99
 
 # Random-walk spread, in logit units per square-root day.
-WALK_SIGMA = 0.5
-# How far the median logit falls when a frozen page is due a refresh.
-REFRESH_SHIFT = 1.2
-# Extra logit spread (standard deviation) that comes with a refresh.
-REFRESH_SPREAD = 0.6
+WALK_SIGMA = 0.30
+# Extrapolation damping per unit of log-time beyond the last read.
+DAMP_RATE = 0.25
 # Slope shrinkage toward the cross-trophy median slope.
 SHRINK = 0.25
-# Extrapolation damping per unit of log-time beyond the last read.
-DAMP_RATE = 0.15
+# Only reads from the last day feed the trend fit.
+WINDOW_HOURS = 24.0
 # The story chain, in order: chapters 1-4, finale, 100%, platinum.
 CHAIN = [3, 4, 5, 6, 7, 14, 1]
+
+# Refresh prior, for a perfectly flat history only:
+#   R  -- tracked players grow by this factor at a refresh.
+#   BETA -- how sharply the new cohort's earn rate falls with rarity.
+#   MU -- trophies the average new player holds (sets the scale A).
+#   REFRESH_SPREAD -- extra logit spread (standard deviation) of a refresh.
+REFRESH_R = 6.06
+REFRESH_BETA = 2.0
+REFRESH_MU = 1.03
+REFRESH_SPREAD = 0.20
 
 
 def parse_time(text):
@@ -154,6 +176,34 @@ def pool_adjacent_violators(values):
     return out
 
 
+def refresh_medians(last_rates):
+    """Median logit of each trophy right after a refresh, from its rate now.
+
+    The refresh brings (R - 1) new players per old one; a new player holds
+    trophy i with probability q_i, which falls steeply with the trophy's
+    rarity, and the scale of q is set so a new player holds MU trophies
+    on average. The refreshed rate is the pooled earners over the pooled
+    players. Solved by bisection on the scale; deterministic.
+    """
+    fracs = [clamp_rate(r) / 100.0 for r in last_rates]
+    power = 1.0 + REFRESH_BETA
+    lo, hi = 0.0, 1.0e7
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        total = sum(min(1.0, mid * (f ** power)) for f in fracs)
+        if total < REFRESH_MU:
+            lo = mid
+        else:
+            hi = mid
+    scale = (lo + hi) / 2.0
+    medians = []
+    for frac in fracs:
+        held = min(1.0, scale * (frac ** power))
+        refreshed = (frac + (REFRESH_R - 1.0) * held) / REFRESH_R * 100.0
+        medians.append(logit(refreshed))
+    return medians
+
+
 def forecast_case(case, name):
     if case["levels"] != LEVELS:
         raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
@@ -168,8 +218,10 @@ def forecast_case(case, name):
     horizon_days = case["horizon_minutes"] / 1440.0
 
     slots = [parse_time(read["slot"]) for read in history]
+    slot_hours = [(slot - EPOCH).total_seconds() / 3600.0 for slot in slots]
     x_reads = [log_hours(slot) for slot in slots]
     x_last = x_reads[-1]
+    last_slot = slot_hours[-1]
 
     # A frozen page: every read reports exactly the same rates, and the
     # reads span at least an hour. Only then does the refresh prior fire.
@@ -178,13 +230,18 @@ def forecast_case(case, name):
     span_minutes = (slots[-1] - slots[0]).total_seconds() / 60.0
     refresh_due = history_flat and span_minutes >= 60.0
 
-    # Fit one line per trophy on its de-duplicated points.
+    # Fit one line per trophy on its de-duplicated points from the last
+    # day of reads. The dedupe state carries across the window's edge so
+    # a level the page held before the window is not counted twice.
     fits = []
     for idx in range(n_trophies):
         xs, ys = [], []
         prev_rate = None
-        for read, x in zip(history, x_reads):
+        for read, x, hour in zip(history, x_reads, slot_hours):
             rate = read["rates"][idx]
+            if hour < last_slot - WINDOW_HOURS:
+                prev_rate = rate
+                continue
             if rate is None:
                 continue
             if prev_rate is not None and rate == prev_rate:
@@ -220,12 +277,21 @@ def forecast_case(case, name):
         var += resid ** 2
         var += (se_b * dx_pos) ** 2
         if refresh_due:
-            m -= REFRESH_SHIFT
             var += REFRESH_SPREAD ** 2
         s = math.sqrt(var)
         s = min(2.0, max(0.30, s))
         medians[trophy["id"]] = m
         spreads[trophy["id"]] = s
+
+    # On a frozen page the trend above is flat, so replace the medians
+    # with the refresh model's rarity-dependent dilution.
+    if refresh_due:
+        last_rates = [
+            r if r is not None else RATE_LOW for r in history[-1]["rates"]
+        ]
+        refreshed = refresh_medians(last_rates)
+        for idx, trophy in enumerate(trophies):
+            medians[trophy["id"]] = refreshed[idx]
 
     # Story-chain monotonicity, in logit space, via PAVA.
     chain_values = [medians[tid] for tid in CHAIN if tid in medians]
